@@ -216,3 +216,56 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================
+# Project Data Files
+# ==========================
+
+# Raw datasets (keep locally)
+data/raw/*.csv
+data/raw/*.zip
+
+# Processed data
+data/bronze/*
+data/silver/*
+data/gold/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+# Parquet and Delta files
+*.parquet
+*.crc
+*.snappy.parquet
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Databricks
+.databricks/
+.databricks-connect
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+airflow/airflow.db
+
+# ML Models
+models/
+*.pkl
+*.joblib
+*.h5
+*.onnx
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
