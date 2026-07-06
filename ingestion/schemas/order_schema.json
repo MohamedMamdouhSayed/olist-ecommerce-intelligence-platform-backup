@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Olist Order",
+  "description": "Starter schema for future order ingestion records.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "order_id": {
+      "type": "string"
+    },
+    "customer_id": {
+      "type": "string"
+    },
+    "order_status": {
+      "type": "string"
+    },
+    "order_purchase_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "order_id",
+    "customer_id",
+    "order_status",
+    "order_purchase_timestamp"
+  ]
+}

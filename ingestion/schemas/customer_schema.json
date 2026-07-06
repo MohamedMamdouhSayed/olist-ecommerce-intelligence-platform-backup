@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Olist Customer",
+  "description": "Starter schema for future customer ingestion records.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "customer_id": {
+      "type": "string"
+    },
+    "customer_unique_id": {
+      "type": "string"
+    },
+    "customer_city": {
+      "type": "string"
+    },
+    "customer_state": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "customer_id",
+    "customer_unique_id",
+    "customer_city",
+    "customer_state"
+  ]
+}

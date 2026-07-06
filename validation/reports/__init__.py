@@ -1,0 +1,2 @@
+"""Data quality report components."""
+

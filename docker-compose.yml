@@ -1,0 +1,54 @@
+# Placeholder local infrastructure for future development phases.
+# Services are intentionally minimal and should be hardened before production use.
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: olist-zookeeper
+    profiles: ["future-infra"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    # TODO: Pin image versions, configure volumes, and externalize secrets.
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: olist-kafka
+    profiles: ["future-infra"]
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    # TODO: Add topic initialization, retention policies, and health checks.
+
+  postgres:
+    image: postgres:latest
+    container_name: olist-postgres
+    profiles: ["future-infra"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: olist
+      POSTGRES_USER: olist
+      POSTGRES_PASSWORD: olist
+    # TODO: Move credentials to environment files or a secrets manager.
+    # TODO: Add persistent volumes before using this service for real workloads.
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: olist-pgadmin
+    profiles: ["future-infra"]
+    depends_on:
+      - postgres
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    # TODO: Replace default credentials and add local server registration.
