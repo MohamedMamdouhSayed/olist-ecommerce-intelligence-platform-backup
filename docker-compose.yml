@@ -16,7 +16,7 @@ services:
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "${KAFKA_NODE_ID:-1}@kafka:9093"
       KAFKA_LISTENERS: "PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://${KAFKA_BOOTSTRAP_SERVER:-localhost:9092},INTERNAL://kafka:29092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092,INTERNAL://kafka:29092"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
@@ -35,10 +35,10 @@ services:
       test:
         [
           "CMD-SHELL",
-          "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1",
+          "bash -c '</dev/tcp/localhost/9092'",
         ]
       interval: 15s
-      timeout: 10s
+      timeout: 5s
       retries: 10
       start_period: 30s
     networks:

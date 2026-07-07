@@ -1,411 +1,450 @@
-"""Enterprise Kafka producer with connection management, retry logic, and observability."""
+"""Reusable Kafka producer base for JSON batch publishing."""
+
+from __future__ import annotations
 
 import json
+import signal
 import time
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from threading import Event
+from types import FrameType
+from typing import Any, Callable
 
-from configs.config import get_settings
-from ingestion.readers.csv_reader import CSVReader
-from observability.decorators import log_execution, measure_time, track_metrics
+import pandas as pd
+from kafka import KafkaProducer
+from kafka.errors import KafkaError
+
+from configs.config import PlatformSettings, get_settings
 from observability.logger import get_logger
-from observability.monitoring import get_global_monitoring_service
+from observability.monitoring import MonitoringService, get_global_monitoring_service
+from validation.reports.quality_report import QualityReport
 from validation.validation_engine import ValidationEngine
-from validation.validation_result import ValidationStatus
-from typing import Optional, Any, Callable
-
-try:
-    from kafka import KafkaProducer
-    from kafka.errors import KafkaError, KafkaTimeoutError
-    KAFKA_AVAILABLE = True
-except ImportError:
-    KAFKA_AVAILABLE = False
-    KafkaProducer = None
-    KafkaError = Exception
-    KafkaTimeoutError = TimeoutError
 
 
-import logging
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+@dataclass(frozen=True)
 class DeliveryReport:
-    """Report of message delivery status."""
+    """Delivery result emitted by the Kafka producer callbacks."""
 
-    def __init__(
-        self,
-        topic: str,
-        partition: int,
-        offset: int,
-        key: Optional[str],
-        value: bytes,
-        timestamp: int,
-        error: Optional[Exception] = None,
-    ):
-        self.topic = topic
-        self.partition = partition
-        self.offset = offset
-        self.key = key
-        self.value = value
-        self.timestamp = timestamp
-        self.error = error
+    topic: str
+    partition: int | None
+    offset: int | None
+    key: str | None
+    error: str | None = None
 
 
 class BaseProducer:
-    """Enterprise Kafka producer with connection management, retry logic, and observability.
-
-    Provides:
-    - Connection Management
-    - Retry Logic
-    - Delivery Callback
-    - JSON Serialization
-    - Graceful Shutdown
-    - Metrics
-    - Logging
-    """
+    """Base Kafka producer with batching, retries, callbacks, and shutdown."""
 
     def __init__(
         self,
         topic: str,
-        bootstrap_servers: Optional[str] = None,
-        batch_size: int = 1000,
+        batch_size: int = 1_000,
         retry_count: int = 3,
-        producer_timeout: int = 30,
+        retry_backoff_seconds: float = 1.0,
+        request_timeout_ms: int = 30_000,
         linger_ms: int = 10,
-        enable_idempotence: bool = True,
-    ):
-        """Initialize the base producer.
-
-        Args:
-            topic: Kafka topic to publish to
-            bootstrap_servers: Kafka bootstrap servers (from config if not provided)
-            batch_size: Number of records per batch
-            retry_count: Number of retry attempts
-            producer_timeout: Producer timeout in seconds
-            linger_ms: Time to wait before sending batch (milliseconds)
-            enable_idempotence: Enable idempotent producer
-        """
-        if not KAFKA_AVAILABLE:
-            raise ImportError(
-                "kafka-python package is required. Install it with: pip install kafka-python"
-            )
-
+        settings: PlatformSettings | None = None,
+        monitoring_service: MonitoringService | None = None,
+    ) -> None:
+        """Initialize shared producer settings from the platform configuration."""
+        self.settings = settings or get_settings()
         self.topic = topic
-        self.settings = get_settings()
-        self.bootstrap_servers = bootstrap_servers or self.settings.kafka_bootstrap_server
         self.batch_size = batch_size
         self.retry_count = retry_count
-        self.producer_timeout = producer_timeout
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.request_timeout_ms = request_timeout_ms
         self.linger_ms = linger_ms
-        self.enable_idempotence = enable_idempotence
+        self.bootstrap_servers = self.settings.kafka_bootstrap_server
+        self.monitoring = monitoring_service or get_global_monitoring_service()
+        self.component_name = f"kafka_producer_{self.topic}"
+        self.shutdown_event = Event()
+        self.producer: KafkaProducer | None = None
+        self.delivery_callback: Callable[[DeliveryReport], None] | None = None
 
-        self._producer: Optional[KafkaProducer] = None
-        self._is_connected = False
-        self._delivery_callback: Optional[Callable[[DeliveryReport], None]] = None
-
-        # Initialize monitoring
-        self.monitoring = get_global_monitoring_service()
-        component_name = f"kafka_producer_{topic}"
-        if not self.monitoring.is_registered(component_name):
-            self.monitoring.register_component(
-                name=component_name,
-                component_type="kafka_producer",
-                metadata={"topic": topic},
-            )
+        self.monitoring.register_component(
+            name=self.component_name,
+            component_type="kafka_producer",
+            metadata={"topic": self.topic},
+        )
+        self._register_shutdown_handlers()
 
         logger.info(
-            f"BaseProducer initialized for topic: {topic} with bootstrap_servers: {self.bootstrap_servers}"
+            "Kafka producer initialized",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {
+                    "topic": self.topic,
+                    "batch_size": self.batch_size,
+                    "bootstrap_servers": self.bootstrap_servers,
+                },
+            },
         )
 
-    @log_execution
-    @measure_time
     def connect(self) -> None:
-        """Create a producer connection to Kafka cluster."""
-        if self._is_connected:
-            logger.warning("Producer already connected", topic=self.topic)
+        """Create the kafka-python producer client."""
+        if self.producer is not None:
             return
 
         try:
-            kafka_config = {
-                "bootstrap_servers": self.bootstrap_servers,
-                "batch_size": self.batch_size,
-                "linger_ms": self.linger_ms,
-                "acks": "all",
-                "retries": self.retry_count,
-                "max_in_flight_requests_per_connection": 5,
-                "enable_idempotence": self.enable_idempotence,
-                "request_timeout_ms": self.producer_timeout * 1000,
-            }
-
-            self._producer = KafkaProducer(**kafka_config)
-            self._is_connected = True
-
+            self.producer = KafkaProducer(
+                bootstrap_servers=self.bootstrap_servers,
+                value_serializer=self._serialize_value,
+                key_serializer=self._serialize_key,
+                acks="all",
+                retries=self.retry_count,
+                retry_backoff_ms=int(self.retry_backoff_seconds * 1_000),
+                request_timeout_ms=self.request_timeout_ms,
+                linger_ms=self.linger_ms,
+            )
             logger.info(
-                f"Kafka producer connected successfully to {self.bootstrap_servers} for topic {self.topic}"
+                "Kafka producer connected",
+                extra={
+                    "pipeline_stage": "ingestion",
+                    "extra_fields": {"topic": self.topic},
+                },
             )
-
-            self.monitoring.record_success(
-                f"kafka_producer_{self.topic}",
-                f"connect_{datetime.utcnow().timestamp()}",
-                duration_ms=0,
-            )
-
-        except Exception as e:
-            self._is_connected = False
-            logger.error(f"Failed to connect to Kafka for topic {self.topic}: {e}")
+        except Exception as exc:
             self.monitoring.record_failure(
-                f"kafka_producer_{self.topic}",
-                f"connect_{datetime.utcnow().timestamp()}",
-                duration_ms=0,
-                error=e,
+                self.component_name,
+                execution_id="producer_connect",
+                duration_ms=0.0,
+                error=exc,
+            )
+            logger.exception(
+                "Kafka producer connection failed",
+                extra={
+                    "pipeline_stage": "ingestion",
+                    "extra_fields": {"topic": self.topic},
+                },
             )
             raise
 
-    def _delivery_report_callback(
+    def close(self) -> None:
+        """Flush pending messages and close the producer gracefully."""
+        if self.producer is None:
+            return
+
+        try:
+            self.producer.flush(timeout=self.request_timeout_ms / 1_000)
+            self.producer.close(timeout=self.request_timeout_ms / 1_000)
+            logger.info(
+                "Kafka producer closed",
+                extra={
+                    "pipeline_stage": "ingestion",
+                    "extra_fields": {"topic": self.topic},
+                },
+            )
+        finally:
+            self.producer = None
+
+    def set_delivery_callback(
         self,
-        error: Optional[KafkaError],
-        record_metadata: Any,
+        callback: Callable[[DeliveryReport], None],
     ) -> None:
-        """Callback for message delivery reports."""
-        if error:
-            report = DeliveryReport(
-                topic=self.topic,
-                partition=-1,
-                offset=-1,
-                key=None,
-                value=b"",
-                timestamp=0,
-                error=error,
+        """Register a callback invoked after each delivery callback event."""
+        self.delivery_callback = callback
+
+    def publish_dataframe(
+        self,
+        dataframe: pd.DataFrame,
+        validation_engine: ValidationEngine,
+        key_column: str | None = None,
+    ) -> dict[str, int]:
+        """Validate and publish a DataFrame in configured batches."""
+        stats = self._empty_stats()
+        self.connect()
+
+        for start in range(0, len(dataframe), self.batch_size):
+            if self.shutdown_event.is_set():
+                break
+
+            batch = dataframe.iloc[start : start + self.batch_size]
+            batch_stats = self._publish_batch(
+                batch=batch,
+                validation_engine=validation_engine,
+                key_column=key_column,
             )
+            self._merge_stats(stats, batch_stats)
 
-            logger.error(f"Message delivery failed for topic {self.topic}: {error}")
+        self.flush()
+        return stats
 
-            if self._delivery_callback:
-                self._delivery_callback(report)
-        else:
-            report = DeliveryReport(
-                topic=record_metadata.topic,
-                partition=record_metadata.partition,
-                offset=record_metadata.offset,
-                key=None,
-                value=b"",
-                timestamp=record_metadata.timestamp,
-            )
+    def publish_csv(
+        self,
+        csv_path: str | Path,
+        validation_engine: ValidationEngine,
+        key_column: str | None = None,
+    ) -> dict[str, int]:
+        """Read a CSV source in chunks, validate records, and publish valid rows."""
+        source_path = Path(csv_path)
+        stats = self._empty_stats()
+        self.connect()
 
-            logger.debug(
-                "Message delivered successfully",
-                topic=self.topic,
-                partition=record_metadata.partition,
-                offset=record_metadata.offset,
-            )
+        logger.info(
+            "CSV publishing started",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {"topic": self.topic, "csv_path": str(source_path)},
+            },
+        )
 
-            if self._delivery_callback:
-                self._delivery_callback(report)
-
-    def set_delivery_callback(self, callback: Callable[[DeliveryReport], None]) -> None:
-        """Set the delivery callback function."""
-        self._delivery_callback = callback
-
-    @track_metrics(component_name="kafka_producer_send")
-    def send(self, record: dict[str, Any], key: Optional[str] = None) -> bool:
-        """Send a single record to Kafka with retry logic.
-
-        Args:
-            record: Record data to send
-            key: Optional message key for partitioning
-
-        Returns:
-            True if sent successfully, False otherwise
-        """
-        if not self._is_connected:
-            logger.error(f"Producer not connected for topic {self.topic}")
-            return False
-
-        for attempt in range(self.retry_count):
-            try:
-                serialized_value = json.dumps(record, default=str).encode("utf-8")
-
-                future = self._producer.send(
-                    self.topic,
-                    key=key.encode("utf-8") if key else None,
-                    value=serialized_value,
-                )
-
-                future.add_callback(self._delivery_report_callback)
-                future.add_errback(self._delivery_report_callback)
-
-                logger.debug("Record sent to Kafka", topic=self.topic, key=key)
-                return True
-
-            except Exception as e:
-                if attempt < self.retry_count - 1:
+        try:
+            for batch in pd.read_csv(source_path, chunksize=self.batch_size):
+                if self.shutdown_event.is_set():
                     logger.warning(
-                        "Send attempt failed, retrying",
-                        topic=self.topic,
-                        attempt=attempt + 1,
-                        total_retries=self.retry_count,
-                        error=str(e),
+                        "CSV publishing interrupted by shutdown request",
+                        extra={
+                            "pipeline_stage": "ingestion",
+                            "extra_fields": {"topic": self.topic},
+                        },
                     )
-                    time.sleep(1 * (attempt + 1))
-                else:
-                    logger.error(f"Failed to send record after retries for topic {self.topic}: {e}")
-                    return False
+                    break
+
+                batch_stats = self._publish_batch(
+                    batch=batch,
+                    validation_engine=validation_engine,
+                    key_column=key_column,
+                )
+                self._merge_stats(stats, batch_stats)
+
+            self.flush()
+            self.monitoring.record_success(
+                self.component_name,
+                execution_id="publish_csv",
+                duration_ms=0.0,
+            )
+            logger.info(
+                "CSV publishing completed",
+                extra={
+                    "pipeline_stage": "ingestion",
+                    "extra_fields": {"topic": self.topic, "stats": stats},
+                },
+            )
+            return stats
+        except Exception as exc:
+            self.monitoring.record_failure(
+                self.component_name,
+                execution_id="publish_csv",
+                duration_ms=0.0,
+                error=exc,
+            )
+            logger.exception(
+                "CSV publishing failed",
+                extra={
+                    "pipeline_stage": "ingestion",
+                    "extra_fields": {"topic": self.topic, "csv_path": str(source_path)},
+                },
+            )
+            raise
+
+    def flush(self) -> None:
+        """Flush pending Kafka messages."""
+        if self.producer is not None:
+            self.producer.flush(timeout=self.request_timeout_ms / 1_000)
+
+    def __enter__(self) -> "BaseProducer":
+        """Return a connected context-managed producer."""
+        self.connect()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        """Close the producer on context manager exit."""
+        self.close()
+
+    def _publish_batch(
+        self,
+        batch: pd.DataFrame,
+        validation_engine: ValidationEngine,
+        key_column: str | None,
+    ) -> dict[str, int]:
+        """Validate a batch and publish records that pass validation."""
+        stats = self._empty_stats()
+        report = validation_engine.run(batch)
+        invalid_indices = self._invalid_indices(report)
+
+        for row_index, row in batch.iterrows():
+            if self.shutdown_event.is_set():
+                break
+
+            stats["processed"] += 1
+            record = self._normalize_record(row.to_dict())
+
+            if row_index in invalid_indices:
+                stats["skipped_invalid"] += 1
+                logger.warning(
+                    "Invalid record skipped",
+                    extra={
+                        "pipeline_stage": "validation",
+                        "extra_fields": {
+                            "topic": self.topic,
+                            "row_index": int(row_index),
+                        },
+                    },
+                )
+                continue
+
+            key = self._record_key(record=record, key_column=key_column)
+            if self._send_with_retry(record=record, key=key):
+                stats["published"] += 1
+            else:
+                stats["failed"] += 1
+
+        self.flush()
+        return stats
+
+    def _send_with_retry(self, record: dict[str, Any], key: str | None) -> bool:
+        """Send one record to Kafka and retry transient producer failures."""
+        if self.producer is None:
+            raise RuntimeError("Kafka producer is not connected.")
+
+        for attempt in range(1, self.retry_count + 1):
+            try:
+                future = self.producer.send(self.topic, key=key, value=record)
+                future.add_callback(self._on_delivery_success, key)
+                future.add_errback(self._on_delivery_error, key)
+                future.get(timeout=self.request_timeout_ms / 1_000)
+                return True
+            except KafkaError as exc:
+                self._log_send_retry(attempt=attempt, error=exc)
+            except Exception as exc:
+                self._log_send_retry(attempt=attempt, error=exc)
+
+            if attempt < self.retry_count:
+                time.sleep(self.retry_backoff_seconds * attempt)
 
         return False
 
-    @log_execution
-    @measure_time
-    def flush(self, timeout: Optional[float] = None) -> bool:
-        """Flush pending messages to Kafka.
+    def _on_delivery_success(self, metadata: Any, key: str | None) -> None:
+        """Handle successful Kafka delivery callback events."""
+        report = DeliveryReport(
+            topic=metadata.topic,
+            partition=metadata.partition,
+            offset=metadata.offset,
+            key=key,
+        )
+        logger.debug(
+            "Kafka message delivered",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {
+                    "topic": report.topic,
+                    "partition": report.partition,
+                    "offset": report.offset,
+                    "key": report.key,
+                },
+            },
+        )
+        if self.delivery_callback is not None:
+            self.delivery_callback(report)
 
-        Args:
-            timeout: Optional timeout in seconds
+    def _on_delivery_error(self, error: BaseException, key: str | None) -> None:
+        """Handle failed Kafka delivery callback events."""
+        report = DeliveryReport(
+            topic=self.topic,
+            partition=None,
+            offset=None,
+            key=key,
+            error=str(error),
+        )
+        logger.error(
+            "Kafka message delivery failed",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {"topic": self.topic, "key": key, "error": str(error)},
+            },
+        )
+        if self.delivery_callback is not None:
+            self.delivery_callback(report)
 
-        Returns:
-            True if flush completed successfully
-        """
-        if not self._is_connected:
-            return False
+    def _log_send_retry(self, attempt: int, error: BaseException) -> None:
+        """Log retry attempts and final send failures."""
+        log_method = logger.warning if attempt < self.retry_count else logger.error
+        log_method(
+            "Kafka send attempt failed",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {
+                    "topic": self.topic,
+                    "attempt": attempt,
+                    "retry_count": self.retry_count,
+                    "error": str(error),
+                },
+            },
+        )
 
-        try:
-            flush_timeout = timeout if timeout is not None else self.producer_timeout
-            self._producer.flush(timeout=flush_timeout)
+    @staticmethod
+    def _serialize_value(value: dict[str, Any]) -> bytes:
+        """Serialize Kafka message values as JSON bytes."""
+        return json.dumps(value, default=str, ensure_ascii=False).encode("utf-8")
 
-            logger.debug("Producer flushed successfully", topic=self.topic)
-            return True
+    @staticmethod
+    def _serialize_key(key: str | None) -> bytes | None:
+        """Serialize Kafka message keys as UTF-8 bytes."""
+        return key.encode("utf-8") if key is not None else None
 
-        except Exception as e:
-            logger.error(f"Failed to flush producer for topic {self.topic}: {e}")
-            return False
+    @staticmethod
+    def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
+        """Convert pandas null values to JSON null-compatible values."""
+        return {key: None if pd.isna(value) else value for key, value in record.items()}
 
-    @log_execution
-    @measure_time
-    def disconnect(self) -> None:
-        """Close the producer connection and release resources."""
-        if self._producer:
-            try:
-                self.flush()
-                self._producer.close()
-                self._is_connected = False
+    @staticmethod
+    def _invalid_indices(report: QualityReport) -> set[Any]:
+        """Collect row indices failed by the validation framework."""
+        invalid_indices: set[Any] = set()
+        for result in report.failed_checks:
+            if result.failed_indices:
+                invalid_indices.update(result.failed_indices)
+        return invalid_indices
 
-                logger.info("Producer disconnected gracefully", topic=self.topic)
+    @staticmethod
+    def _record_key(record: dict[str, Any], key_column: str | None) -> str | None:
+        """Return the Kafka message key from the configured record column."""
+        if key_column is None:
+            return None
 
-            except Exception as e:
-                logger.error(f"Error closing producer for topic {self.topic}: {e}")
+        value = record.get(key_column)
+        return None if value is None else str(value)
 
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.disconnect()
-
-    @property
-    def is_connected(self) -> bool:
-        """Check if producer is connected."""
-        return self._is_connected
-
-    @log_execution
-    @measure_time
-    def ingest_from_csv(
-        self,
-        csv_path: str | Path,
-        validation_engine: Optional[ValidationEngine] = None,
-        key_column: Optional[str] = None,
-    ) -> dict[str, int]:
-        """Load, validate, and send records from a CSV file.
-
-        Args:
-            csv_path: Path to the CSV source file
-            validation_engine: Optional validation engine with registered validators
-            key_column: Optional column name to use as Kafka message key
-
-        Returns:
-            Dictionary with processing statistics
-        """
-        stats = {"total_processed": 0, "total_published": 0, "total_failed": 0}
-        csv_reader = CSVReader()
-        
-        logger.info(f"Starting CSV ingestion for topic {self.topic} from path {csv_path}")
-        self.connect()
-
-        try:
-            # Use a dummy dataframe if file reading fails during testing
-            try:
-                df = csv_reader.load_dataframe(csv_path)
-            except Exception as e:
-                logger.error(f"Failed to load CSV: {e}")
-                return stats
-            
-            # Run validation if engine is provided
-            invalid_indices = set()
-            validation_errors: dict[int, list[str]] = {}
-            
-            if validation_engine:
-                report = validation_engine.run(df)
-                for check in report.failed_checks:
-                    if check.failed_indices:
-                        for idx in check.failed_indices:
-                            invalid_indices.add(idx)
-                            if idx not in validation_errors:
-                                validation_errors[idx] = []
-                            validation_errors[idx].append(f"{check.validation_name}: {check.message}")
-
-            # Process rows
-            for idx, row in df.iterrows():
-                stats["total_processed"] += 1
-                record = row.to_dict()
-                
-                if idx in invalid_indices:
-                    stats["total_failed"] += 1
-                    self._handle_failed_record(
-                        record, 
-                        "Validation failed", 
-                        validation_errors.get(idx, ["Unknown validation error"])
-                    )
-                    continue
-
-                key = str(record.get(key_column)) if key_column else None
-                if self.send(record, key=key):
-                    stats["total_published"] += 1
-                else:
-                    stats["total_failed"] += 1
-                    self._handle_failed_record(record, "Kafka send failed")
-
-            self.flush()
-            
-        except Exception as e:
-            logger.error("Ingestion failed", error=str(e))
-            raise
-
-        logger.info(f"Ingestion completed for topic {self.topic}: {stats}")
-        return stats
-
-    def _handle_failed_record(
-        self,
-        record: dict[str, Any],
-        error_message: str,
-        errors: Optional[list[str]] = None,
-    ) -> None:
-        """Handle failed records by persisting them to disk."""
-        failed_dir = Path(self.settings.data_path) / "failed_records" / self.topic
-        failed_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        file_path = failed_dir / f"failed_{timestamp_str}.json"
-
-        failed_payload = {
-            "record": record,
-            "error": error_message,
-            "validation_errors": errors,
-            "topic": self.topic,
-            "timestamp": datetime.utcnow().isoformat(),
+    @staticmethod
+    def _empty_stats() -> dict[str, int]:
+        """Return the standard producer statistics payload."""
+        return {
+            "processed": 0,
+            "published": 0,
+            "skipped_invalid": 0,
+            "failed": 0,
         }
 
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(failed_payload, f, indent=2, default=str)
+    @staticmethod
+    def _merge_stats(target: dict[str, int], source: dict[str, int]) -> None:
+        """Merge source statistics into target statistics."""
+        for key, value in source.items():
+            target[key] += value
 
-        logger.warning("Failed record persisted", path=str(file_path))
+    def _register_shutdown_handlers(self) -> None:
+        """Register signal handlers for graceful producer shutdown."""
+        try:
+            signal.signal(signal.SIGINT, self._request_shutdown)
+            signal.signal(signal.SIGTERM, self._request_shutdown)
+        except ValueError:
+            logger.debug("Signal handlers can only be registered on the main thread.")
 
+    def _request_shutdown(self, signum: int, frame: FrameType | None) -> None:
+        """Request a graceful shutdown from an operating system signal."""
+        self.shutdown_event.set()
+        logger.warning(
+            "Graceful shutdown requested",
+            extra={
+                "pipeline_stage": "ingestion",
+                "extra_fields": {"topic": self.topic, "signal": signum},
+            },
+        )
