@@ -1,10 +1,5 @@
 # Databricks notebook source
-"""Backward-compatible Orders Bronze streaming entry point.
-
-Prefer `03_stream_orders.py` for new Databricks jobs. This notebook keeps the
-previous Confluent Orders pipeline name available while delegating all reusable
-streaming logic to the shared Bronze framework.
-"""
+"""Stream Olist orders from Confluent Cloud Kafka into Bronze Delta Lake."""
 
 # COMMAND ----------
 
@@ -13,6 +8,8 @@ from streaming.schemas import OrdersSchema
 
 # COMMAND ----------
 
+# Dataset configuration. For production, populate API_KEY and API_SECRET from
+# Databricks secrets instead of literal values.
 TABLE_NAME = "orders"
 TOPIC = "orders"
 SCHEMA = OrdersSchema
