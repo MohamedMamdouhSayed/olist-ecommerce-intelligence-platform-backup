@@ -40,6 +40,10 @@ class PlatformSettings(BaseSettings):
     gold_path: Path = Field(default=Path("data/gold"), alias="GOLD_PATH")
 
     kafka_bootstrap_server: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVER")
+    kafka_api_key: str | None = Field(default=None, alias="KAFKA_API_KEY")
+    kafka_api_secret: str | None = Field(default=None, alias="KAFKA_API_SECRET")
+    kafka_security_protocol: str = Field(default="SASL_SSL", alias="KAFKA_SECURITY_PROTOCOL")
+    kafka_sasl_mechanism: str = Field(default="PLAIN", alias="KAFKA_SASL_MECHANISM")
     kafka_topic_orders: str = Field(default="olist.orders", alias="KAFKA_TOPIC_ORDERS")
     kafka_topic_customers: str = Field(default="olist.customers", alias="KAFKA_TOPIC_CUSTOMERS")
     kafka_topic_products: str = Field(default="olist.products", alias="KAFKA_TOPIC_PRODUCTS")
@@ -58,6 +62,8 @@ class PlatformSettings(BaseSettings):
     @field_validator(
         "project_name",
         "kafka_bootstrap_server",
+        "kafka_security_protocol",
+        "kafka_sasl_mechanism",
         "kafka_topic_orders",
         "kafka_topic_customers",
         "kafka_topic_products",
@@ -118,4 +124,3 @@ class PlatformSettings(BaseSettings):
 def get_settings() -> PlatformSettings:
     """Return cached, validated platform settings."""
     return PlatformSettings()
-

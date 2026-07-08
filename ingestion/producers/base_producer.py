@@ -23,6 +23,8 @@ from validation.validation_engine import ValidationEngine
 
 
 logger = get_logger(__name__)
+LOCAL_KAFKA_BOOTSTRAP_SERVER = "localhost:9092"
+CONFLUENT_CLOUD_BOOTSTRAP_SERVER = "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,7 @@ class BaseProducer:
         self,
         topic: str,
         batch_size: int = 1_000,
-        retry_count: int = 3,
+        retry_count: int = 5,
         retry_backoff_seconds: float = 1.0,
         request_timeout_ms: int = 30_000,
         linger_ms: int = 10,
@@ -58,7 +60,7 @@ class BaseProducer:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.request_timeout_ms = request_timeout_ms
         self.linger_ms = linger_ms
-        self.bootstrap_servers = self.settings.kafka_bootstrap_server
+        self.bootstrap_servers = self._bootstrap_servers()
         self.monitoring = monitoring_service or get_global_monitoring_service()
         self.component_name = f"kafka_producer_{self.topic}"
         self.shutdown_event = Event()
@@ -90,16 +92,7 @@ class BaseProducer:
             return
 
         try:
-            self.producer = KafkaProducer(
-                bootstrap_servers=self.bootstrap_servers,
-                value_serializer=self._serialize_value,
-                key_serializer=self._serialize_key,
-                acks="all",
-                retries=self.retry_count,
-                retry_backoff_ms=int(self.retry_backoff_seconds * 1_000),
-                request_timeout_ms=self.request_timeout_ms,
-                linger_ms=self.linger_ms,
-            )
+            self.producer = KafkaProducer(**self._producer_config())
             logger.info(
                 "Kafka producer connected",
                 extra={
@@ -380,6 +373,44 @@ class BaseProducer:
                 },
             },
         )
+
+    def _producer_config(self) -> dict[str, Any]:
+        """Build KafkaProducer settings for local Kafka or Confluent Cloud."""
+        config: dict[str, Any] = {
+            "bootstrap_servers": self._bootstrap_servers(),
+            "value_serializer": lambda v: json.dumps(v).encode("utf-8"),
+            "key_serializer": lambda k: k.encode("utf-8") if k else None,
+            "acks": "all",
+            "retries": self.retry_count,
+            "retry_backoff_ms": int(self.retry_backoff_seconds * 1_000),
+            "request_timeout_ms": self.request_timeout_ms,
+            "linger_ms": self.linger_ms,
+        }
+
+        if self.settings.kafka_api_key and self.settings.kafka_api_secret:
+            config.update(
+                {
+                    "security_protocol": self.settings.kafka_security_protocol,
+                    "sasl_mechanism": self.settings.kafka_sasl_mechanism,
+                    "sasl_plain_username": self.settings.kafka_api_key,
+                    "sasl_plain_password": self.settings.kafka_api_secret,
+                }
+            )
+
+        return config
+
+    def _bootstrap_servers(self) -> str:
+        """Return Confluent Cloud bootstrap servers or local Kafka fallback."""
+        if self.settings.kafka_api_key:
+            if not self.settings.kafka_api_secret:
+                raise ValueError("KAFKA_API_SECRET is required when KAFKA_API_KEY is set.")
+
+            if self.settings.kafka_bootstrap_server == LOCAL_KAFKA_BOOTSTRAP_SERVER:
+                return CONFLUENT_CLOUD_BOOTSTRAP_SERVER
+
+            return self.settings.kafka_bootstrap_server
+
+        return LOCAL_KAFKA_BOOTSTRAP_SERVER
 
     @staticmethod
     def _serialize_value(value: dict[str, Any]) -> bytes:
